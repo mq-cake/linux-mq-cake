@@ -8,9 +8,10 @@
 #define HORIZON	20000000 //20ms
 #define TW_LENGTH	1
 
+// #define TARGET_RATE 10000000 //10 mbit
 // #define TARGET_RATE 1000000 //1 mbit
-// #define TARGET_RATE 100000 //100 kbit
 #define TARGET_RATE 500000 //500 kbit
+// #define TARGET_RATE 100000 //100 kbit
 // #define TARGET_RATE 1000 //1 kbit
 const u64 TARGET_RATE_NS = (NSEC_PER_SEC/TARGET_RATE);  
 // #define MC_DEBUG
@@ -21,6 +22,7 @@ DEFINE_PER_CPU(struct sk_buff *, next_pkt);
 DEFINE_PER_CPU(struct list_head[TW_LENGTH], timing_wheel);
 static bool *active;
 static int num_tx_queues;
+static int counter;
 struct mc_sched_data {
 	struct list_head timing_wheel[TW_LENGTH];
 	u64 last_enqueued;
@@ -59,6 +61,9 @@ static int mc_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 		pr_err("set to now\n");
 #endif
 	}
+
+	if (counter++ % 10==0)
+		pr_err("Active queues: %d\n", num_active_qs);
 
 	priv->last_enqueued = skb->skb_mstamp_ns;
 	list_add_tail(&skb->list, &priv->timing_wheel[0]);
@@ -121,7 +126,7 @@ static int mc_init(struct Qdisc *sch, struct nlattr *opt,
 	int i;
 	u64 *t;
 	struct mc_sched_data *priv = qdisc_priv(sch);
-    pr_err("In: %s v0.5 %lx\n", __func__, (unsigned long)sch);
+    pr_err("In: %s v0.7 %lx\n", __func__, (unsigned long)sch);
 	for_each_possible_cpu(i) {
 		t = &per_cpu(last_time_span, i);
 		*t = 0;
