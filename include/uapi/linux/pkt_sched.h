@@ -1278,4 +1278,14 @@ enum {
 
 #define TCA_ETS_MAX (__TCA_ETS_MAX - 1)
 
+/* MC */
+
+enum {
+	TCA_MC_UNSPEC,
+	TCA_MC_MAX_RATE,	/* per flow max rate */
+	__TCA_MC_MAX
+};
+
+#define TCA_MC_MAX	(__TCA_MC_MAX - 1)
+
 #endif
