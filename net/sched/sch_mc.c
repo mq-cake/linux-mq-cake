@@ -10,11 +10,14 @@
 
 // overlimit: nr_of_watchdog triggers
 // qstat.backlog how often ran the queue empty
-// qstat.requeues: nr_of_sync loops 
+// qstat.requeues: count of retry limit reached
 
 #define SYNC_PERIOD 100*1000*1000 // 100 ms
 #define QLEN_LIMIT_DEFAULT 100
 #define WD_SLACK 0
+#define RETRIES_MAX 20
+
+static u64 time_next_packet_global;
  
 struct mc_sched_data {
 	struct list_head q;		/* queue where the packets are stored */
@@ -70,19 +73,17 @@ static int mc_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 static struct sk_buff *mc_qdisc_dequeue(struct Qdisc *sch)
 {
 	struct sk_buff *s;
-	int num_active_qs = 1;
 	u64 now;
+	u64 expected;
+	u64 len, len_tmp;
+	u64 time_next_packet_local;
+	u8 retries = 0;
 	struct mc_sched_data *priv = qdisc_priv(sch);
-	u64 len;
-	struct list_head *pos;
 
 	if (list_empty(&priv->q))	{
 		sch->qstats.backlog++;
 		return NULL;
 	}
-
-	if (priv->packets_sent)
-		WRITE_ONCE(priv->active, true);
 
 	/*send immediately*/
 	if (priv->max_rate == 0) {
@@ -94,51 +95,43 @@ static struct sk_buff *mc_qdisc_dequeue(struct Qdisc *sch)
 		return s;
 	}
 	
-
-	now = ktime_get_ns();
-
-	if (now-priv->last_checked_active >= priv->sync_time) { //check every 100ms is the default
-		rcu_read_lock();
-		list_for_each_rcu(pos, &priv->mc_list) {
-			struct mc_sched_data *other_priv = container_of(pos, struct mc_sched_data, mc_list);
-			u64 other_pkts_sent = READ_ONCE(other_priv->packets_sent);
-			if (other_pkts_sent != priv->qdisc_wd_active[other_priv->txq_num]) {
-				num_active_qs++;
-			}
-			priv->qdisc_wd_active[other_priv->txq_num] = other_pkts_sent;
-		}
-		rcu_read_unlock();
-		priv->last_checked_active = now;
-		priv->last_active_qs = num_active_qs;
-		sch->qstats.requeues++;
-		priv->total_nr_of_active_qs += num_active_qs;
-		priv->nr_of_sync_loops++;
-	}
-
 	s = list_first_entry(&priv->q, struct sk_buff, list);
+	len = qdisc_pkt_len(s)*NSEC_PER_SEC;
+	len = div64_ul(len, priv->max_rate);
 
-	if (priv->time_next_packet <= now) {
-		priv->qlen--;
-		sch->qstats.qlen--;
-		list_del(&s->list);
-		priv->packets_sent++;
-		
-		len = qdisc_pkt_len(s)*NSEC_PER_SEC*(priv->last_active_qs);
-		len = div64_ul(len, priv->max_rate);
-
-		if (priv->time_next_packet)
-			len -= min(len/2, now-priv->time_next_packet);
-
-		priv->time_next_packet = now+len;
-	}
-	else {
-		if (priv->time_next_packet != priv->last_watchdog ){
+	time_next_packet_local = READ_ONCE(time_next_packet_global);
+	do {
+		now = ktime_get_ns();
+		// we could send a packet
+		if ( time_next_packet_local <= now ) {
+			expected = time_next_packet_local;
+			// compensate for watchdog overhead and/or inaccuracies
+			len_tmp = len - min(len/2, now-time_next_packet_local);
+			// Try to update to new timestamp
+			time_next_packet_local = cmpxchg64(&time_next_packet_global, expected, now+len_tmp); 
+		} else { // the next time to send a packet is in the future
 			sch->qstats.overlimits++;
-			qdisc_watchdog_schedule_range_ns(&priv->watchdog, priv->time_next_packet, priv->wd_slack);
-			priv->last_watchdog = priv->time_next_packet;
+			qdisc_watchdog_schedule_range_ns(&priv->watchdog, time_next_packet_local, priv->wd_slack);
+			return NULL;
 		}
-		s = NULL;
+		retries++;
+		// Retries just here to prevent spinning too long
+	} while(time_next_packet_local != expected && retries < RETRIES_MAX);
+
+	if (retries >= RETRIES_MAX) {
+		sch->qstats.requeues++;
+		sch->qstats.overlimits++;
+		qdisc_watchdog_schedule_range_ns(&priv->watchdog, time_next_packet_local, priv->wd_slack);
+		return NULL;
 	}
+
+	// sucessfully updated the time_next_packet 
+	// Dequeue packet and return
+
+	priv->qlen--;
+	sch->qstats.qlen--;
+	list_del(&s->list);
+	priv->packets_sent++;
 
 	return s;
 }
