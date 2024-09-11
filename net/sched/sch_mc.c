@@ -15,7 +15,7 @@
 #define SYNC_PERIOD 100*1000*1000 // 100 ms
 #define QLEN_LIMIT_DEFAULT 100
 #define WD_SLACK 0
-#define RETRIES_MAX 20
+#define RETRIES_MAX 80
 
 static u64 time_next_packet_global;
  
