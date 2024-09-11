@@ -118,8 +118,8 @@ static struct sk_buff *mc_qdisc_dequeue(struct Qdisc *sch)
 		// Retries just here to prevent spinning too long
 	} while(time_next_packet_local != expected && retries < RETRIES_MAX);
 
+	sch->qstats.requeues += retries;
 	if (retries >= RETRIES_MAX) {
-		sch->qstats.requeues++;
 		sch->qstats.overlimits++;
 		qdisc_watchdog_schedule_range_ns(&priv->watchdog, time_next_packet_local, priv->wd_slack);
 		return NULL;
