@@ -65,6 +65,7 @@
 #include <linux/reciprocal_div.h>
 #include <net/netlink.h>
 #include <linux/if_vlan.h>
+#include <net/gso.h>
 #include <net/pkt_sched.h>
 #include <net/pkt_cls.h>
 #include <net/tcp.h>
@@ -253,6 +254,15 @@ struct cake_sched_data {
 	u16		max_adjlen;
 	u16		min_netlen;
 	u16		min_adjlen;
+	struct list_head cake_qdisc_list;
+	u32 num_tx_queues;
+	u32 txq_num;
+	u64 qdisc_wd_active[64];
+	u64 last_checked_active;
+	u64 qlen;
+	u64 packets_sent;
+	u64 sync_time;
+	u64 active_queues;
 };
 
 enum {
@@ -363,6 +373,7 @@ static const u8 bulk_order[] = {1, 0, 2, 3};
 #define REC_INV_SQRT_CACHE (16)
 static u32 cobalt_rec_inv_sqrt_cache[REC_INV_SQRT_CACHE] = {0};
 
+static void cake_set_rate(struct cake_tin_data *b, u64 rate, u32 mtu,u64 target_ns, u64 rtt_est_ns);
 /* http://en.wikipedia.org/wiki/Methods_of_computing_square_roots
  * new_invsqrt = (invsqrt / 2) * (3 - count * invsqrt^2)
  *
@@ -1209,7 +1220,7 @@ static struct sk_buff *cake_ack_filter(struct cake_sched_data *q,
 			    iph_check->daddr != iph->daddr)
 				continue;
 
-			seglen = ntohs(iph_check->tot_len) -
+			seglen = iph_totlen(skb, iph_check) -
 				       (4 * iph_check->ihl);
 		} else if (iph_check->version == 6) {
 			ipv6h = (struct ipv6hdr *)iph;
@@ -1360,7 +1371,7 @@ static u32 cake_overhead(struct cake_sched_data *q, const struct sk_buff *skb)
 		return cake_calc_overhead(q, len, off);
 
 	/* borrowed from qdisc_pkt_len_init() */
-	hdr_len = skb_transport_header(skb) - skb_mac_header(skb);
+	hdr_len = skb_transport_offset(skb);
 
 	/* + transport layer */
 	if (likely(shinfo->gso_type & (SKB_GSO_TCPV4 |
@@ -1368,14 +1379,14 @@ static u32 cake_overhead(struct cake_sched_data *q, const struct sk_buff *skb)
 		const struct tcphdr *th;
 		struct tcphdr _tcphdr;
 
-		th = skb_header_pointer(skb, skb_transport_offset(skb),
+		th = skb_header_pointer(skb, hdr_len,
 					sizeof(_tcphdr), &_tcphdr);
 		if (likely(th))
 			hdr_len += __tcp_hdrlen(th);
 	} else {
 		struct udphdr _udphdr;
 
-		if (skb_header_pointer(skb, skb_transport_offset(skb),
+		if (skb_header_pointer(skb, hdr_len,
 				       sizeof(_udphdr), &_udphdr))
 			hdr_len += sizeof(struct udphdr);
 	}
@@ -1549,6 +1560,7 @@ static unsigned int cake_drop(struct Qdisc *sch, struct sk_buff **to_free)
 
 	__qdisc_drop(skb, to_free);
 	sch->q.qlen--;
+	q->qlen--;
 
 	cake_heapify(q, 0);
 
@@ -1756,6 +1768,7 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 			flow_queue_add(flow, segs);
 
 			sch->q.qlen++;
+			q->qlen++;
 			numsegs++;
 			slen += segs->len;
 			q->buffer_used += segs->truesize;
@@ -1793,6 +1806,7 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 			consume_skb(ack);
 		} else {
 			sch->q.qlen++;
+			q->qlen++;
 			q->buffer_used      += skb->truesize;
 		}
 
@@ -1923,6 +1937,7 @@ static struct sk_buff *cake_dequeue_one(struct Qdisc *sch)
 		sch->qstats.backlog      -= len;
 		q->buffer_used		 -= skb->truesize;
 		sch->q.qlen--;
+		q->qlen--;
 
 		if (q->overflow_timeout)
 			cake_heapify(q, b->overflow_idx[q->cur_flow]);
@@ -1951,10 +1966,34 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
 	struct cake_flow *flow;
 	struct list_head *head;
 	bool first_flow = true;
+	struct list_head *pos;
 	struct sk_buff *skb;
+	u32 num_active_qs = 1;
+	u64 new_rate = q->rate_bps;
 	u16 host_load;
 	u64 delay;
 	u32 len;
+
+	if (now-q->last_checked_active >= q->sync_time) { //check every 1ms is the default
+		rcu_read_lock();
+		list_for_each_rcu(pos, &q->cake_qdisc_list) {
+			struct cake_sched_data *other_priv = container_of(pos, struct cake_sched_data, cake_qdisc_list);
+			u64 other_pkts_sent = READ_ONCE(other_priv->packets_sent);
+			u64 other_qlen = READ_ONCE(other_priv->qlen);
+			if (other_qlen || other_pkts_sent != READ_ONCE(q->qdisc_wd_active[other_priv->txq_num])) {
+				num_active_qs++;
+			}
+			WRITE_ONCE(q->qdisc_wd_active[other_priv->txq_num], other_pkts_sent);
+		}
+		rcu_read_unlock();
+		q->last_checked_active = now;
+		if (num_active_qs)
+			new_rate=div64_u64(q->rate_bps, num_active_qs);
+		q->active_queues = num_active_qs;
+		cake_set_rate(b, new_rate, 1514, 5000000, 100000000);
+		q->rate_ns=b->tin_rate_ns;
+		q->rate_shft=b->tin_rate_shft;
+	}
 
 begin:
 	if (!sch->q.qlen)
@@ -2182,6 +2221,7 @@ retry:
 
 	b->tin_ecn_mark += !!flow->cvars.ecn_marked;
 	qdisc_bstats_update(sch, skb);
+	q->packets_sent++;
 
 	/* collect delay stats */
 	delay = ktime_to_ns(ktime_sub(now, cobalt_get_enqueue_time(skb)));
@@ -2252,6 +2292,8 @@ static const struct nla_policy cake_policy[TCA_CAKE_MAX + 1] = {
 	[TCA_CAKE_ACK_FILTER]	 = { .type = NLA_U32 },
 	[TCA_CAKE_SPLIT_GSO]	 = { .type = NLA_U32 },
 	[TCA_CAKE_FWMARK]	 = { .type = NLA_U32 },
+	[TCA_CAKE_SYNC_TIME]	 = { .type = NLA_U32 },
+	[TCA_CAKE_ACTIVE_QUEUES]	 = { .type = NLA_U32 },
 };
 
 static void cake_set_rate(struct cake_tin_data *b, u64 rate, u32 mtu,
@@ -2291,6 +2333,8 @@ static void cake_set_rate(struct cake_tin_data *b, u64 rate, u32 mtu,
 	b->cparams.mtu_time = byte_target_ns;
 	b->cparams.p_inc = 1 << 24; /* 1/256 */
 	b->cparams.p_dec = 1 << 20; /* 1/4096 */
+	// pr_err("In %s: rate: %llu mtu: %u target_ns: %llu rtt_est_ns %llu\n", __func__
+	// 		, rate, mtu, target_ns, rtt_est_ns);
 }
 
 static int cake_config_besteffort(struct Qdisc *sch)
@@ -2679,6 +2723,11 @@ static int cake_change(struct Qdisc *sch, struct nlattr *opt,
 		q->fwmark_shft = q->fwmark_mask ? __ffs(q->fwmark_mask) : 0;
 	}
 
+	if (tb[TCA_CAKE_SYNC_TIME]) {
+		u32 sync_us = nla_get_u32(tb[TCA_CAKE_SYNC_TIME]);
+		q->sync_time = (u64)sync_us * 1000; // from us to ns
+	}
+
 	if (q->tins) {
 		sch_tree_lock(sch);
 		cake_reconfigure(sch);
@@ -2691,17 +2740,29 @@ static int cake_change(struct Qdisc *sch, struct nlattr *opt,
 static void cake_destroy(struct Qdisc *sch)
 {
 	struct cake_sched_data *q = qdisc_priv(sch);
+	spinlock_t *root_lock;
+
+	root_lock = qdisc_lock(qdisc_root(sch));
+	spin_lock(root_lock);
+	//is this safe? Yes, __qdisc_destroy calls the free function with call_rcu
+	list_del_rcu(&q->cake_qdisc_list);
+	spin_unlock(root_lock);
 
 	qdisc_watchdog_cancel(&q->watchdog);
 	tcf_block_put(q->block);
 	kvfree(q->tins);
 }
-
+static struct Qdisc_ops cake_qdisc_ops;
 static int cake_init(struct Qdisc *sch, struct nlattr *opt,
 		     struct netlink_ext_ack *extack)
 {
 	struct cake_sched_data *q = qdisc_priv(sch);
 	int i, j, err;
+	struct net_device *net;
+	struct list_head *pos;
+	struct cake_sched_data *lpriv;
+	spinlock_t *root_lock;
+	u32 num_of_qdiscs = 0;
 
 	sch->limit = 10240;
 	q->tin_mode = CAKE_DIFFSERV_DIFFSERV3;
@@ -2718,6 +2779,7 @@ static int cake_init(struct Qdisc *sch, struct nlattr *opt,
 	q->cur_flow  = 0;
 
 	qdisc_watchdog_init(&q->watchdog, sch);
+	q->sync_time = 1000*1000; // default 1ms sync time
 
 	if (opt) {
 		err = cake_change(sch, opt, extack);
@@ -2766,6 +2828,30 @@ static int cake_init(struct Qdisc *sch, struct nlattr *opt,
 	q->avg_peak_bandwidth = q->rate_bps;
 	q->min_netlen = ~0;
 	q->min_adjlen = ~0;
+
+	INIT_LIST_HEAD_RCU(&q->cake_qdisc_list);
+	root_lock = qdisc_lock(qdisc_root(sch));
+	spin_lock(root_lock);
+	net = qdisc_dev(sch);
+	for (i = 0; i < net->num_tx_queues; ++i){
+		if (net->_tx[i].qdisc->ops == &cake_qdisc_ops && net->_tx[i].qdisc->handle != sch->handle) {
+			struct cake_sched_data *other_priv = qdisc_priv(net->_tx[i].qdisc);
+			list_add_rcu(&q->cake_qdisc_list, &other_priv->cake_qdisc_list);
+			break;
+		}
+	}
+	spin_unlock(root_lock);
+
+	list_for_each_rcu(pos, &q->cake_qdisc_list) {
+		struct cake_sched_data *priv = container_of(pos, struct cake_sched_data, cake_qdisc_list);
+		num_of_qdiscs++;
+		pr_err("cake list: %u\n", priv->txq_num);
+	}
+	q->txq_num = num_of_qdiscs;
+	lpriv = container_of(pos, struct cake_sched_data, cake_qdisc_list);
+	pr_err("cake total num: %u\n", lpriv->txq_num+1);
+	pr_err("cake sync_time: %llu\n", q->sync_time);
+	q->active_queues=0;
 	return 0;
 }
 
@@ -2835,6 +2921,8 @@ static int cake_dump(struct Qdisc *sch, struct sk_buff *skb)
 		goto nla_put_failure;
 
 	if (nla_put_u32(skb, TCA_CAKE_FWMARK, q->fwmark_mask))
+		goto nla_put_failure;
+	if (nla_put_u64_64bit(skb, TCA_CAKE_ACTIVE_QUEUES, q->active_queues,1))
 		goto nla_put_failure;
 
 	return nla_nest_end(skb, opts);
@@ -3000,6 +3088,7 @@ static int cake_dump_class_stats(struct Qdisc *sch, unsigned long cl,
 			skb = flow->head;
 			while (skb) {
 				qs.qlen++;
+				q->qlen++;
 				skb = skb->next;
 			}
 			sch_tree_unlock(sch);
