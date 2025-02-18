@@ -2013,7 +2013,6 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
 	struct sk_buff *skb;
 	u32 num_active_qs = 1;
 	u64 new_rate = q->rate_bps;
-	u16 host_load;
 	u64 delay;
 	u32 len;
 
