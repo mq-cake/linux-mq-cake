@@ -394,9 +394,12 @@ static int mqprio_init(struct Qdisc *sch, struct nlattr *opt,
 		return -ENOMEM;
 
 	for (i = 0; i < dev->num_tx_queues; i++) {
+		const struct Qdisc_ops *default_ops = get_default_qdisc_ops(dev, i);
+		struct qdisc_shared_data *shared;
+
 		dev_queue = netdev_get_tx_queue(dev, i);
 		qdisc = qdisc_create_dflt(dev_queue,
-					  get_default_qdisc_ops(dev, i),
+					  default_ops,
 					  TC_H_MAKE(TC_H_MAJ(sch->handle),
 						    TC_H_MIN(i + 1)), extack);
 		if (!qdisc)
@@ -404,6 +407,14 @@ static int mqprio_init(struct Qdisc *sch, struct nlattr *opt,
 
 		priv->qdiscs[i] = qdisc;
 		qdisc->flags |= TCQ_F_ONETXQUEUE | TCQ_F_NOPARENT;
+
+		if (default_ops->shared_size) {
+			shared = qdisc_shared_get(sch, default_ops);
+			if (!shared)
+				return -ENOMEM;
+
+			qdisc->ops->shared_assign(qdisc, &shared->data);
+		}
 	}
 
 	/* If the mqprio options indicate that hardware should own
@@ -465,9 +476,18 @@ static int mqprio_graft(struct Qdisc *sch, unsigned long cl, struct Qdisc *new,
 {
 	struct net_device *dev = qdisc_dev(sch);
 	struct netdev_queue *dev_queue = mqprio_queue_get(sch, cl);
+	struct qdisc_shared_data *shared;
 
 	if (!dev_queue)
 		return -EINVAL;
+
+	if (new && new->ops->shared_size) {
+		shared = qdisc_shared_get(sch, new->ops);
+		if (!shared)
+			return -ENOMEM;
+
+		new->ops->shared_assign(new, &shared->data);
+	}
 
 	if (dev->flags & IFF_UP)
 		dev_deactivate(dev);
@@ -476,6 +496,11 @@ static int mqprio_graft(struct Qdisc *sch, unsigned long cl, struct Qdisc *new,
 
 	if (new)
 		new->flags |= TCQ_F_ONETXQUEUE | TCQ_F_NOPARENT;
+
+	if (*old && (*old)->ops->shared_size) {
+		(*old)->ops->shared_assign(*old, NULL);
+		qdisc_shared_put(sch, (*old)->ops);
+	}
 
 	if (dev->flags & IFF_UP)
 		dev_activate(dev);

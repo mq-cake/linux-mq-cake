@@ -70,6 +70,14 @@ struct qdisc_skb_head {
 	spinlock_t	lock;
 };
 
+struct qdisc_shared_data {
+	struct list_head	 head;
+	const struct Qdisc_ops	*owner;
+	struct rcu_head	 rcu;
+	refcount_t		 refs;
+	u8			 data[];
+};
+
 struct Qdisc {
 	int 			(*enqueue)(struct sk_buff *skb,
 					   struct Qdisc *sch,
@@ -109,7 +117,7 @@ struct Qdisc {
 	struct gnet_stats_queue	__percpu *cpu_qstats;
 	int			pad;
 	refcount_t		refcnt;
-
+	struct list_head	shared_state;
 	/*
 	 * For performance sake on SMP, we put highly modified fields at the end
 	 */
@@ -289,6 +297,7 @@ struct Qdisc_ops {
 	const struct Qdisc_class_ops	*cl_ops;
 	char			id[IFNAMSIZ];
 	int			priv_size;
+	int			shared_size;
 	unsigned int		static_flags;
 
 	int 			(*enqueue)(struct sk_buff *skb,
@@ -318,6 +327,9 @@ struct Qdisc_ops {
 						    u32 block_index);
 	u32			(*ingress_block_get)(struct Qdisc *sch);
 	u32			(*egress_block_get)(struct Qdisc *sch);
+
+	void			(*shared_init)(void *shared);
+	void			(*shared_assign)(struct Qdisc *, void *shared);
 
 	struct module		*owner;
 };
@@ -696,6 +708,9 @@ void qdisc_destroy(struct Qdisc *qdisc);
 void qdisc_put(struct Qdisc *qdisc);
 void qdisc_put_unlocked(struct Qdisc *qdisc);
 void qdisc_tree_reduce_backlog(struct Qdisc *qdisc, int n, int len);
+struct qdisc_shared_data *qdisc_shared_get(struct Qdisc *sch,
+					   const struct Qdisc_ops *owner);
+void qdisc_shared_put(struct Qdisc *sch, const struct Qdisc_ops *owner);
 #ifdef CONFIG_NET_SCHED
 int qdisc_offload_dump_helper(struct Qdisc *q, enum tc_setup_type type,
 			      void *type_data);

@@ -954,6 +954,7 @@ struct Qdisc *qdisc_alloc(struct netdev_queue *dev_queue,
 	lockdep_register_key(&sch->root_lock_key);
 	spin_lock_init(&sch->q.lock);
 	lockdep_set_class(&sch->q.lock, &sch->root_lock_key);
+	INIT_LIST_HEAD(&sch->shared_state);
 
 	if (ops->static_flags & TCQ_F_CPUSTATS) {
 		sch->cpu_bstats =
@@ -1424,6 +1425,7 @@ void mq_change_real_num_tx(struct Qdisc *sch, unsigned int new_real_tx)
 {
 #ifdef CONFIG_NET_SCHED
 	struct net_device *dev = qdisc_dev(sch);
+	struct qdisc_shared_data *shared;
 	struct Qdisc *qdisc;
 	unsigned int i;
 
@@ -1432,13 +1434,26 @@ void mq_change_real_num_tx(struct Qdisc *sch, unsigned int new_real_tx)
 		/* Only update the default qdiscs we created,
 		 * qdiscs with handles are always hashed.
 		 */
-		if (qdisc != &noop_qdisc && !qdisc->handle)
+		if (qdisc != &noop_qdisc && !qdisc->handle) {
 			qdisc_hash_del(qdisc);
+
+			if (qdisc->ops->shared_size) {
+				qdisc->ops->shared_assign(qdisc, NULL);
+				qdisc_shared_put(sch, qdisc->ops);
+			}
+		}
 	}
 	for (i = dev->real_num_tx_queues; i < new_real_tx; i++) {
 		qdisc = rtnl_dereference(netdev_get_tx_queue(dev, i)->qdisc_sleeping);
-		if (qdisc != &noop_qdisc && !qdisc->handle)
+		if (qdisc != &noop_qdisc && !qdisc->handle) {
 			qdisc_hash_add(qdisc, false);
+
+			if (qdisc->ops->shared_size) {
+				shared = qdisc_shared_get(sch, qdisc->ops);
+				if (shared)
+					qdisc->ops->shared_assign(qdisc, shared);
+			}
+		}
 	}
 #endif
 }
@@ -1496,6 +1511,55 @@ void dev_shutdown(struct net_device *dev)
 
 	WARN_ON(timer_pending(&dev->watchdog_timer));
 }
+
+static struct qdisc_shared_data *qdisc_shared_find(struct Qdisc *sch,
+						   const struct Qdisc_ops *owner)
+{
+	struct qdisc_shared_data *shared;
+
+	list_for_each_entry(shared, &sch->shared_state, head)
+		if (shared->owner == owner)
+			return shared;
+
+	return NULL;
+}
+
+struct qdisc_shared_data *qdisc_shared_get(struct Qdisc *sch,
+					   const struct Qdisc_ops *owner)
+{
+	struct qdisc_shared_data *shared;
+
+	shared = qdisc_shared_find(sch, owner);
+	if (shared && refcount_inc_not_zero(&shared->refs))
+		return shared;
+
+	shared = kmalloc(sizeof(struct qdisc_shared_data) + owner->shared_size,
+			 GFP_KERNEL | __GFP_ZERO);
+	if (!shared)
+		return NULL;
+
+	if (owner->shared_init)
+		owner->shared_init(&shared->data);
+
+	refcount_set(&shared->refs, 1);
+	shared->owner = owner;
+	list_add_tail(&shared->head, &sch->shared_state);
+	return shared;
+}
+EXPORT_SYMBOL(qdisc_shared_get);
+
+void qdisc_shared_put(struct Qdisc *sch, const struct Qdisc_ops *owner)
+{
+	struct qdisc_shared_data *shared;
+
+	shared = qdisc_shared_find(sch, owner);
+	if (!shared || !refcount_dec_and_test(&shared->refs))
+		return;
+
+	list_del_init(&shared->head);
+	kfree_rcu(shared, rcu);
+}
+EXPORT_SYMBOL(qdisc_shared_put);
 
 /**
  * psched_ratecfg_precompute__() - Pre-compute values for reciprocal division
