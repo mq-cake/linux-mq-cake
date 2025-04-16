@@ -1562,7 +1562,7 @@ static unsigned int cake_drop(struct Qdisc *sch, struct sk_buff **to_free)
 
 	__qdisc_drop(skb, to_free);
 	sch->q.qlen--;
-	q->qlen--;
+	WRITE_ONCE(q->qlen, q->qlen-1);
 
 	cake_heapify(q, 0);
 
@@ -1770,7 +1770,7 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 			flow_queue_add(flow, segs);
 
 			sch->q.qlen++;
-			q->qlen++;
+			WRITE_ONCE(q->qlen, q->qlen+1);
 			numsegs++;
 			slen += segs->len;
 			q->buffer_used += segs->truesize;
@@ -1808,7 +1808,7 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 			consume_skb(ack);
 		} else {
 			sch->q.qlen++;
-			q->qlen++;
+			WRITE_ONCE(q->qlen, q->qlen+1);
 			q->buffer_used      += skb->truesize;
 		}
 
@@ -1939,7 +1939,7 @@ static struct sk_buff *cake_dequeue_one(struct Qdisc *sch)
 		sch->qstats.backlog      -= len;
 		q->buffer_used		 -= skb->truesize;
 		sch->q.qlen--;
-		q->qlen--;
+		WRITE_ONCE(q->qlen, q->qlen-1);
 
 		if (q->overflow_timeout)
 			cake_heapify(q, b->overflow_idx[q->cur_flow]);
@@ -2249,7 +2249,7 @@ retry:
 
 	b->tin_ecn_mark += !!flow->cvars.ecn_marked;
 	qdisc_bstats_update(sch, skb);
-	q->last_active = now;
+	WRITE_ONCE(q->last_active, now);
 
 	/* collect delay stats */
 	delay = ktime_to_ns(ktime_sub(now, cobalt_get_enqueue_time(skb)));
@@ -3124,7 +3124,7 @@ static int cake_dump_class_stats(struct Qdisc *sch, unsigned long cl,
 			skb = flow->head;
 			while (skb) {
 				qs.qlen++;
-				q->qlen++;
+				WRITE_ONCE(q->qlen, q->qlen+1);
 				skb = skb->next;
 			}
 			sch_tree_unlock(sch);
