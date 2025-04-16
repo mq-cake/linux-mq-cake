@@ -2004,6 +2004,11 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
 		}
 		rcu_read_unlock();
 
+		if (unlikely(q->sync_time == 0)) {
+			q->sync_time = (ktime_get() - now) << 4;
+			pr_err("Configured Synctime: %llu\n", q->sync_time);
+		}
+
 		if (num_active_qs)
 			new_rate=div64_u64(q->rate_bps, num_active_qs);
 
