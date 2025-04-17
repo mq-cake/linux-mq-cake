@@ -259,12 +259,15 @@ struct cake_sched_data {
 	u32 txq_num;
 	u64 last_active;
 	u64 last_checked_active;
+	// u64 last_rate_estimate;
 	u64 qlen;
 	u64 sync_time;
 	u64 active_queues;
 	s64 min_timer_slack;
 	s64 max_timer_slack;
 	s64 avg_timer_slack;
+	u64 bytes_diff;
+	u64 current_rate;
 };
 
 enum {
@@ -1985,11 +1988,13 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
 	u16 host_load;
 	u64 delay;
 	u32 len;
+	u32 num_of_queues_sending_slower = 0;
 
-	if (now-q->last_checked_active >= q->sync_time) { //check every 1ms is the default
+	if (now-q->last_checked_active >= q->sync_time) {
 		u64 other_last_active;
 		struct list_head *pos;
 		u32 num_active_qs = 1;
+		u64 rate_sum = 0;
 
 		rcu_read_lock();
 		list_for_each_rcu(pos, &q->cake_qdisc_list) {
@@ -2000,6 +2005,10 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
 
 			if (other_qlen || other_last_active > q->last_active) {
 				num_active_qs++;
+				rate_sum += READ_ONCE(other_priv->current_rate);
+				if (q->bytes_diff > other_priv->bytes_diff) {
+					num_of_queues_sending_slower++;
+				}
 			}
 		}
 		rcu_read_unlock();
@@ -2014,11 +2023,33 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
 
 		q->active_queues = num_active_qs;
 
+		// pr_err("Rate sum: %llu vs: target_rate %llu\n", rate_sum, q->rate_bps);
+		// Can we maybe increase our sending speed?
+		if (rate_sum < (q->rate_bps-(q->rate_bps >> 4))) {
+		// 	// If we are using our sending speed increase new_rate by 5%
+			// if (q->current_rate >= new_rate-(new_rate>>4)) {
+			// if (num_of_queues_sending_slower > 0) {
+				new_rate += (new_rate>>3);
+			// }
+			// else if (q->current_rate < new_rate-(new_rate>>3)) {
+			// 	new_rate -= (new_rate>>3);
+			// }
+		}
+
 		// mtu = 0 is used to only update the rate and not mess with cobalt params
 		cake_set_rate(b, new_rate, 0, 0, 0);
+
+		u64 r = div64_u64(q->bytes_diff*NSEC_PER_SEC, ktime_sub(now, q->last_checked_active));
+		q->current_rate = cake_ewma(q->current_rate, r, 8);
+		q->bytes_diff=0;
+		// q->last_rate_estimate = now;
+
+
 		q->last_checked_active = now;
 		q->rate_ns=b->tin_rate_ns;
 		q->rate_shft=b->tin_rate_shft;
+
+
 	}
 
 
@@ -2250,6 +2281,7 @@ retry:
 	b->tin_ecn_mark += !!flow->cvars.ecn_marked;
 	qdisc_bstats_update(sch, skb);
 	WRITE_ONCE(q->last_active, now);
+	q->bytes_diff += qdisc_pkt_len(skb);
 
 	/* collect delay stats */
 	delay = ktime_to_ns(ktime_sub(now, cobalt_get_enqueue_time(skb)));
@@ -2775,6 +2807,7 @@ static void cake_destroy(struct Qdisc *sch)
 
 	root_lock = qdisc_lock(qdisc_root(sch));
 	spin_lock(root_lock);
+	pr_err("avg rate: %llu\n", q->current_rate);
 
 	list_del_rcu(&q->cake_qdisc_list);
 	spin_unlock(root_lock);
