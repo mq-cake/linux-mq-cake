@@ -1,5 +1,4 @@
 #include "linux/math64.h"
-#include "linux/netlink.h"
 #include "linux/pkt_sched.h"
 #include "linux/printk.h"
 #include "net/netlink.h"
@@ -17,8 +16,8 @@
 #define WD_SLACK 0
 #define RETRIES_MAX 80
 
-// static atomic64_t time_next_packet_global;
-static u64 time_next_packet_global;
+static atomic64_t time_next_packet_global;
+// static u64 time_next_packet_global;
  
 struct mc_sched_data {
 	struct list_head q;		/* queue where the packets are stored */
@@ -75,12 +74,8 @@ static struct sk_buff *mc_qdisc_dequeue(struct Qdisc *sch)
 {
 	struct sk_buff *s;
 	u64 now;
-	u64 expected;
-	u64 len, len_tmp;
-	u64 time_next_packet_local;
-	u8 retries = 0;
+	u64 len;
 	struct mc_sched_data *priv = qdisc_priv(sch);
-	u64 l = READ_ONCE(time_next_packet_global);
 
 	if (list_empty(&priv->q))	{
 		sch->qstats.backlog++;
@@ -101,41 +96,24 @@ static struct sk_buff *mc_qdisc_dequeue(struct Qdisc *sch)
 	len = qdisc_pkt_len(s)*NSEC_PER_SEC;
 	len = div64_ul(len, priv->max_rate);
 
+	now = ktime_get_ns();
+	u64 time_next_packet_local = atomic64_read(&time_next_packet_global);
+    
+    if (unlikely(time_next_packet_local == 0)) {
+        atomic64_set(&time_next_packet_global, now);
+        pr_err("now: %llu\n", now);
+    }
 
+	// we could send a packet
+	if ( time_next_packet_local <= now ) {
+		// compensate for watchdog overhead and/or inaccuracies
+	    atomic64_fetch_add(len,&time_next_packet_global);
+    } else { // the next time to send a packet is in the future
+        sch->qstats.overlimits++;
+        qdisc_watchdog_schedule_range_ns(&priv->watchdog, time_next_packet_local, 0);
+        return NULL;
+    }
 
-	// time_next_packet_local = READ_ONCE(time_next_packet_global);
-	// do {
-	// 	now = ktime_get_ns();
-	// 	// we could send a packet
-	// 	if ( time_next_packet_local <= now ) {
-	// 		expected = time_next_packet_local;
-	// 		// compensate for watchdog overhead and/or inaccuracies
-	// 		len_tmp = len - min(len/2, now-time_next_packet_local);
-	// 		// Try to update to new timestamp
-	// 		time_next_packet_local = cmpxchg64(&time_next_packet_global, expected, now+len_tmp); 
-	// 	} else { // the next time to send a packet is in the future
-	// 		sch->qstats.overlimits++;
-	// 		qdisc_watchdog_schedule_range_ns(&priv->watchdog, time_next_packet_local, priv->wd_slack);
-	// 		return NULL;
-	// 	}
-	// 	retries++;
-	// 	// Retries just here to prevent spinning too long
-	// } while(time_next_packet_local != expected && retries < RETRIES_MAX);
-
-	// sch->qstats.requeues += retries;
-	// if (retries >= RETRIES_MAX) {
-	// 	sch->qstats.overlimits++;
-	// 	qdisc_watchdog_schedule_range_ns(&priv->watchdog, time_next_packet_local, priv->wd_slack);
-	// 	return NULL;
-	// }
-
-	// sucessfully updated the time_next_packet 
-	// Dequeue packet and return
-	//
-	
-	// atomic64_fetch_add(2,&time_next_packet_global);
-	//
-	WRITE_ONCE(time_next_packet_global, l+2);
 	priv->qlen--;
 	sch->qstats.qlen--;
 	list_del(&s->list);
@@ -283,6 +261,7 @@ static int mc_init(struct Qdisc *sch, struct nlattr *opt,
 	priv->txq_num = num_of_qdiscs;
 	lpriv = container_of(pos, struct mc_sched_data, mc_list);
 	pr_err("list: %u\n", lpriv->txq_num);
+    atomic64_set(&time_next_packet_global, 0);
 
 	if (opt)
 		err = mc_change(sch, opt, extack);
