@@ -259,7 +259,6 @@ struct cake_sched_data {
 	u32 txq_num;
 	u64 last_active;
 	u64 last_checked_active;
-	// u64 last_rate_estimate;
 	u64 qlen;
 	u64 sync_time;
 	u64 active_queues;
@@ -268,6 +267,7 @@ struct cake_sched_data {
 	s64 avg_timer_slack;
 	u64 bytes_diff;
 	u64 current_rate;
+	bool dynamic_sync;
 };
 
 enum {
@@ -1988,13 +1988,11 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
 	u16 host_load;
 	u64 delay;
 	u32 len;
-	u32 num_of_queues_sending_slower = 0;
 
 	if (now-q->last_checked_active >= q->sync_time) {
 		u64 other_last_active;
 		struct list_head *pos;
 		u32 num_active_qs = 1;
-		u64 rate_sum = 0;
 
 		rcu_read_lock();
 		list_for_each_rcu(pos, &q->cake_qdisc_list) {
@@ -2003,53 +2001,50 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
 
 			other_last_active = READ_ONCE(other_priv->last_active);
 
-			if (other_qlen || other_last_active > q->last_active) {
+			if (other_qlen || other_last_active > q->last_checked_active) {
 				num_active_qs++;
-				rate_sum += READ_ONCE(other_priv->current_rate);
-				if (q->bytes_diff > other_priv->bytes_diff) {
-					num_of_queues_sending_slower++;
-				}
 			}
 		}
 		rcu_read_unlock();
 
-		if (unlikely(q->sync_time == 0)) {
-			q->sync_time = (ktime_get() - now) << 4;
-			pr_err("Configured Synctime: %llu\n", q->sync_time);
-		}
 
 		if (num_active_qs)
-			new_rate=div64_u64(q->rate_bps, num_active_qs);
+			new_rate=div64_u64(q->rate_bps, num_active_qs); // should this be b->tin_rate_bps
 
 		q->active_queues = num_active_qs;
 
-		// pr_err("Rate sum: %llu vs: target_rate %llu\n", rate_sum, q->rate_bps);
-		// Can we maybe increase our sending speed?
-		if (rate_sum < (q->rate_bps-(q->rate_bps >> 4))) {
-		// 	// If we are using our sending speed increase new_rate by 5%
-			// if (q->current_rate >= new_rate-(new_rate>>4)) {
-			// if (num_of_queues_sending_slower > 0) {
-				new_rate += (new_rate>>3);
-			// }
-			// else if (q->current_rate < new_rate-(new_rate>>3)) {
-			// 	new_rate -= (new_rate>>3);
-			// }
-		}
+
+		// if (q->dynamic_sync) {
+		// 	u64 r = div64_u64(q->bytes_diff*NSEC_PER_SEC, ktime_sub(now, q->last_checked_active));
+		// 	q->current_rate = cake_ewma(q->current_rate, r, 8);
+		// 	q->bytes_diff=0;
+		// 	// pr_err("Rate sum: %llu vs: target_rate %llu\n", rate_sum, q->rate_bps);
+		// 	// Are we using less bandwidth than we could?
+		// 	// Then lets reduce the synctime in hope we can use the additional cycles
+		// 	// for sending packets
+		// 	if (q->current_rate < (b->tin_rate_bps-(b->tin_rate_bps >> 6))) {
+		// 		q->sync_time = min(q->sync_time+10000, USEC_PER_SEC); // +10us, max 1ms
+		// 	}
+		// 	// We have enough "power" to fill the link, let's see if we can be
+		// 	// more accurate by lowering the synctime
+		// 	else if (q->current_rate >= (b->tin_rate_bps-(b->tin_rate_bps >> 6))) {
+		// 		q->sync_time = max(q->sync_time-10000, 10000); // -10us, 10us
+		// 	}
+		// }
 
 		// mtu = 0 is used to only update the rate and not mess with cobalt params
 		cake_set_rate(b, new_rate, 0, 0, 0);
-
-		u64 r = div64_u64(q->bytes_diff*NSEC_PER_SEC, ktime_sub(now, q->last_checked_active));
-		q->current_rate = cake_ewma(q->current_rate, r, 8);
-		q->bytes_diff=0;
-		// q->last_rate_estimate = now;
-
 
 		q->last_checked_active = now;
 		q->rate_ns=b->tin_rate_ns;
 		q->rate_shft=b->tin_rate_shft;
 
-
+		if (q->dynamic_sync) {
+			q->sync_time = (ktime_get() - now) << 4;
+			// sync for every 16*64 byte
+			// q->sync_time = ((64*q->rate_ns)>>q->rate_shft)<<4;
+			// q->dynamic_sync = true;
+		}
 	}
 
 
@@ -2808,6 +2803,8 @@ static void cake_destroy(struct Qdisc *sch)
 	root_lock = qdisc_lock(qdisc_root(sch));
 	spin_lock(root_lock);
 	pr_err("avg rate: %llu\n", q->current_rate);
+	pr_err("queues: %llu\n", q->active_queues);
+	pr_err("sync: %llu\n", q->sync_time);
 
 	list_del_rcu(&q->cake_qdisc_list);
 	spin_unlock(root_lock);
@@ -2915,6 +2912,10 @@ static int cake_init(struct Qdisc *sch, struct nlattr *opt,
 	q->active_queues=0;
 	q->last_checked_active = 0;
 	q->min_timer_slack=S64_MAX;
+	q->dynamic_sync = false;
+	if (q->sync_time == 0)
+		q->dynamic_sync = true;
+
 	return 0;
 }
 
