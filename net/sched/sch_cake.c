@@ -81,6 +81,10 @@
 #define CAKE_FLOW_MASK 63
 #define CAKE_FLOW_NAT_FLAG 64
 
+static atomic64_t q_time_next_packet_g;
+static atomic64_t b_time_next_packet_g;
+static atomic64_t failsafe_time_next_packet_g;
+
 /* struct cobalt_params - contains codel and blue parameters
  * @interval:	codel initial drop rate
  * @target:     maximum persistent sojourn time & blue update rate
@@ -1480,21 +1484,22 @@ static int cake_advance_shaper(struct cake_sched_data *q,
 		u64 tin_dur = (len * b->tin_rate_ns) >> b->tin_rate_shft;
 		u64 global_dur = (len * q->rate_ns) >> q->rate_shft;
 		u64 failsafe_dur = global_dur + (global_dur >> 1);
+		ktime_t tmp_time;
+		ktime_t b_time_next_packet_l = ns_to_ktime(atomic64_read(&b_time_next_packet_g));
 
-		if (ktime_before(b->time_next_packet, now))
-			b->time_next_packet = ktime_add_ns(b->time_next_packet,
-							   tin_dur);
+		if (ktime_before(b_time_next_packet_l, now))
+			atomic64_fetch_add(tin_dur, &b_time_next_packet_g);
 
-		else if (ktime_before(b->time_next_packet,
-				      ktime_add_ns(now, tin_dur)))
-			b->time_next_packet = ktime_add_ns(now, tin_dur);
+		else if (ktime_before(b_time_next_packet_l,
+				      ktime_add_ns(now, tin_dur))) {
+			tmp_time = ktime_add_ns(now, tin_dur);
+			atomic64_set(&b_time_next_packet_g, ktime_to_ns(tmp_time));
+		}
 
-		q->time_next_packet = ktime_add_ns(q->time_next_packet,
-						   global_dur);
+		atomic64_fetch_add(global_dur, &q_time_next_packet_g);
+
 		if (!drop)
-			q->failsafe_next_packet = \
-				ktime_add_ns(q->failsafe_next_packet,
-					     failsafe_dur);
+			atomic64_fetch_add(failsafe_dur, &failsafe_time_next_packet_g);
 	}
 	return len;
 }
@@ -1717,19 +1722,22 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 
 	/* ensure shaper state isn't stale */
 	if (!b->tin_backlog) {
-		if (ktime_before(b->time_next_packet, now))
-			b->time_next_packet = now;
+		ktime_t b_time_next_packet_l = ns_to_ktime(atomic64_read(&b_time_next_packet_g));
+		ktime_t q_time_next_packet_l = ns_to_ktime(atomic64_read(&q_time_next_packet_g));
+		ktime_t q_failsafe_next_packet_l = ns_to_ktime(atomic64_read(&failsafe_time_next_packet_g));
+		if (ktime_before(b_time_next_packet_l, now))
+			atomic64_set(&b_time_next_packet_g, now);
 
 		if (!sch->q.qlen) {
-			if (ktime_before(q->time_next_packet, now)) {
-				q->failsafe_next_packet = now;
-				q->time_next_packet = now;
-			} else if (ktime_after(q->time_next_packet, now) &&
-				   ktime_after(q->failsafe_next_packet, now)) {
+			if (ktime_before(q_time_next_packet_l, now)) {
+				atomic64_set(&failsafe_time_next_packet_g, now);
+				atomic64_set(&q_time_next_packet_g, now);
+			} else if (ktime_after(q_time_next_packet_l, now) &&
+				   ktime_after(q_failsafe_next_packet_l, now)) {
 				u64 next = \
-					min(ktime_to_ns(q->time_next_packet),
+					min(ktime_to_ns(q_time_next_packet_l),
 					    ktime_to_ns(
-						   q->failsafe_next_packet));
+						   q_failsafe_next_packet_l));
 				sch->qstats.overlimits++;
 				qdisc_watchdog_schedule_ns(&q->watchdog, next);
 			}
@@ -1962,10 +1970,13 @@ begin:
 		return NULL;
 
 	/* global hard shaper */
-	if (ktime_after(q->time_next_packet, now) &&
-	    ktime_after(q->failsafe_next_packet, now)) {
-		u64 next = min(ktime_to_ns(q->time_next_packet),
-			       ktime_to_ns(q->failsafe_next_packet));
+	ktime_t b_time_next_packet_l = ns_to_ktime(atomic64_read(&b_time_next_packet_g));
+	ktime_t q_time_next_packet_l = ns_to_ktime(atomic64_read(&q_time_next_packet_g));
+	ktime_t q_failsafe_next_packet_l = ns_to_ktime(atomic64_read(&failsafe_time_next_packet_g));
+	if (ktime_after(q_time_next_packet_l, now) &&
+	    ktime_after(q_failsafe_next_packet_l, now)) {
+		u64 next = min(ktime_to_ns(q_time_next_packet_l),
+			       ktime_to_ns(q_failsafe_next_packet_l));
 
 		sch->qstats.overlimits++;
 		qdisc_watchdog_schedule_ns(&q->watchdog, next);
@@ -2012,11 +2023,12 @@ begin:
 		ktime_t best_time = KTIME_MAX;
 		int tin, best_tin = 0;
 
+		// ktime_t b_time_next_packet_l = ns_to_ktime(atomic64_read(&b_time_next_packet_g));
 		for (tin = 0; tin < q->tin_cnt; tin++) {
 			b = q->tins + tin;
 			if ((b->sparse_flow_count + b->bulk_flow_count) > 0) {
 				ktime_t time_to_pkt = \
-					ktime_sub(b->time_next_packet, now);
+					ktime_sub(b_time_next_packet_l, now);
 
 				if (ktime_to_ns(time_to_pkt) <= 0 ||
 				    ktime_compare(time_to_pkt,
@@ -2196,9 +2208,11 @@ retry:
 	flow->deficit -= len;
 	b->tin_deficit -= len;
 
-	if (ktime_after(q->time_next_packet, now) && sch->q.qlen) {
-		u64 next = min(ktime_to_ns(q->time_next_packet),
-			       ktime_to_ns(q->failsafe_next_packet));
+	// q_time_next_packet_l = ns_to_ktime(atomic64_read(&q_time_next_packet_g));
+	// q_failsafe_next_packet_l = ns_to_ktime(atomic64_read(&failsafe_time_next_packet_g));
+	if (ktime_after(q_time_next_packet_l, now) && sch->q.qlen) {
+		u64 next = min(ktime_to_ns(q_time_next_packet_l),
+			       ktime_to_ns(q_failsafe_next_packet_l));
 
 		qdisc_watchdog_schedule_ns(&q->watchdog, next);
 	} else if (!sch->q.qlen) {
