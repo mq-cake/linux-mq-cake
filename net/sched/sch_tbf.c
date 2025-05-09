@@ -100,7 +100,6 @@ struct tbf_sched_data {
 	u32		max_size;
 	s64		buffer;		/* Token bucket depth/rate: MUST BE >= MTU/B */
 	s64		mtu;
-	struct psched_ratecfg global_rate;
 	struct psched_ratecfg rate;
 	struct psched_ratecfg peak;
 
@@ -281,6 +280,7 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	}
 	ret = qdisc_enqueue(skb, q->qdisc, to_free);
 	if (ret != NET_XMIT_SUCCESS) {
+	// pr_err("backlog: %u, skb: %u, limit: %u, buffer: %llu\n", q->qdisc->qstats.backlog, qdisc_pkt_len(skb), q->qdisc->limit, q->buffer);
 		if (net_xmit_drop_count(ret))
 			qdisc_qstats_drop(sch);
 		return ret;
@@ -310,7 +310,7 @@ static struct sk_buff *tbf_dequeue(struct Qdisc *sch)
 		unsigned int len = qdisc_pkt_len(skb);
 		now = ktime_get_ns();
 
-		if (now-q->last_checked_active >= 20000) {
+		if (now-q->last_checked_active >= 10000) {
 			u64 other_last_active;
 			struct list_head *pos;
 			u32 num_active_qs = 1;
@@ -331,7 +331,7 @@ static struct sk_buff *tbf_dequeue(struct Qdisc *sch)
 
 
 			if (num_active_qs)
-				new_rate=div64_u64(q->global_rate.rate_bytes_ps, num_active_qs);
+				new_rate=div64_u64(q->rate.rate_bytes_ps, num_active_qs);
 
 			q->active_queues = num_active_qs;
 			tbf_set_rate(q, new_rate);
@@ -355,8 +355,10 @@ static struct sk_buff *tbf_dequeue(struct Qdisc *sch)
 
 		if ((toks|ptoks) >= 0) {
 			skb = qdisc_dequeue_peeked(q->qdisc);
-			if (unlikely(!skb))
+			if (unlikely(!skb)) {
+				pr_err("empty\n");
 				return NULL;
+			}
 
 			q->t_c = now;
 			q->last_active = now;
@@ -370,6 +372,7 @@ static struct sk_buff *tbf_dequeue(struct Qdisc *sch)
 
 		qdisc_watchdog_schedule_ns(&q->watchdog,
 					   now + max_t(long, -toks, -ptoks));
+		// pr_err("Scheduled wd to %llu\n", now + max_t(long, -toks, -ptoks));
 
 		/* Maybe we have a shorter packet in the queue,
 		   which can be sent now. It sounds cool,
@@ -384,6 +387,8 @@ static struct sk_buff *tbf_dequeue(struct Qdisc *sch)
 
 		qdisc_qstats_overlimit(sch);
 	}
+	// if (q->qdisc->qstats.backlog != 0)
+	// 	pr_err("no peek, backlog: %u\n", q->qdisc->qstats.backlog);
 	return NULL;
 }
 
@@ -494,6 +499,7 @@ static int tbf_change(struct Qdisc *sch, struct nlattr *opt,
 		if (err)
 			goto done;
 	} else if (qopt->limit > 0) {
+		// pr_err("qopt limit %u\n", qopt->limit);
 		child = fifo_create_dflt(sch, &bfifo_qdisc_ops, qopt->limit,
 					 extack);
 		if (IS_ERR(child)) {
@@ -525,7 +531,6 @@ static int tbf_change(struct Qdisc *sch, struct nlattr *opt,
 	q->ptokens = q->mtu;
 
 	memcpy(&q->rate, &rate, sizeof(struct psched_ratecfg));
-	memcpy(&q->global_rate, &rate, sizeof(struct psched_ratecfg));
 	memcpy(&q->peak, &peak, sizeof(struct psched_ratecfg));
 
 	sch_tree_unlock(sch);
@@ -534,15 +539,17 @@ static int tbf_change(struct Qdisc *sch, struct nlattr *opt,
 
 	tbf_offload_change(sch);
 
-	pr_err("limit: %u\n", q->limit);
-	pr_err("maxsize: %u\n", q->max_size);
-	pr_err("buffer: %llu\n", q->buffer);
-	pr_err("tokens: %llu\n", q->tokens);
-	pr_err("ptokens: %llu\n", q->ptokens);
-	pr_err("rate: %llu\n", rate.rate_bytes_ps);
-	pr_err("rate_mult: %u\n", rate.mult);
-	pr_err("rate_mult: %u\n", rate.shift);
-	pr_err("len2time: %llu\n", psched_l2t_ns(&rate, 1514));
+	// pr_err("limit: %u\n", q->limit);
+	// pr_err("init sch-limit: %u\n", q->qdisc->limit);
+	// pr_err("init sch-backlog: %u\n", q->qdisc->qstats.backlog);
+	// pr_err("init maxsize: %u\n", q->max_size);
+	// pr_err("init buffer: %llu\n", q->buffer);
+	// pr_err("init tokens: %llu\n", q->tokens);
+	// pr_err("init ptokens: %llu\n", q->ptokens);
+	// pr_err("init rate: %llu\n", rate.rate_bytes_ps);
+	// pr_err("init rate_mult: %u\n", rate.mult);
+	// pr_err("init rate_mult: %u\n", rate.shift);
+	// pr_err("len2time: %llu\n", psched_l2t_ns(&rate, 1514));
 done:
 	return err;
 }
@@ -586,6 +593,18 @@ static int tbf_init(struct Qdisc *sch, struct nlattr *opt,
 static void tbf_destroy(struct Qdisc *sch)
 {
 	struct tbf_sched_data *q = qdisc_priv(sch);
+
+	// pr_err("limit: %u\n", q->limit);
+	// pr_err("sch-limit: %u\n", q->qdisc->limit);
+	// pr_err("sch-backlog: %u\n", q->qdisc->qstats.backlog);
+	// pr_err("maxsize: %u\n", q->max_size);
+	// pr_err("buffer: %llu\n", q->buffer);
+	// pr_err("tokens: %llu\n", q->tokens);
+	// pr_err("ptokens: %llu\n", q->ptokens);
+	// pr_err("rate: %llu\n", q->rate.rate_bytes_ps);
+	// pr_err("rate_mult: %u\n", q->rate.mult);
+	// pr_err("rate_shift: %u\n", q->rate.shift);
+	// pr_err("active-queues: %llu\n", q->active_queues);
 
 	qdisc_watchdog_cancel(&q->watchdog);
 	tbf_offload_destroy(sch);
