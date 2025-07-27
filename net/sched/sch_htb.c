@@ -702,7 +702,9 @@ static void htb_charge_class(struct htb_sched *q, struct htb_class *cl,
 	enum htb_cmode old_mode;
 	s64 diff;
 
+	//TODO: Figure out the number of active queues.
 	while (cl) {
+		// TODO:  update tokens, buffer rate here
 		diff = min_t(s64, q->now - cl->t_c, cl->mbuffer);
 		if (cl->level >= level) {
 			if (cl->level == level)
@@ -1063,6 +1065,8 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt,
 	bool offload;
 	int err;
 
+	pr_err("Init htb: %s\n", __func__);
+
 	qdisc_watchdog_init(&q->watchdog, sch);
 	INIT_WORK(&q->work, htb_work_func);
 
@@ -1125,6 +1129,7 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt,
 	for (ntx = 0; ntx < q->num_direct_qdiscs; ntx++) {
 		struct netdev_queue *dev_queue = netdev_get_tx_queue(dev, ntx);
 		struct Qdisc *qdisc;
+		pr_err("Executing this loop\n");
 
 		qdisc = qdisc_create_dflt(dev_queue, &pfifo_qdisc_ops,
 					  TC_H_MAKE(sch->handle, 0), extack);
@@ -1782,6 +1787,8 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 	u64 rate64, ceil64;
 	int warn = 0;
 
+
+	pr_err("Change class: %s\n", __func__);
 	/* extract all subattrs from opt attr */
 	if (!opt)
 		goto failure;
@@ -1824,6 +1831,9 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 
 	rate64 = tb[TCA_HTB_RATE64] ? nla_get_u64(tb[TCA_HTB_RATE64]) : 0;
 	ceil64 = tb[TCA_HTB_CEIL64] ? nla_get_u64(tb[TCA_HTB_CEIL64]) : 0;
+
+	pr_err("rate64: %llu, ceil64: %llu\n", rate64, ceil64);
+	pr_err("hopt->rate: %u, hopt->ceil: %u\n", hopt->rate.rate, hopt->ceil.rate);
 
 	if (!cl) {		/* new class */
 		struct net_device *dev = qdisc_dev(sch);
@@ -2040,6 +2050,7 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 	 * is really leaf before changing cl->leaf !
 	 */
 	if (!cl->level) {
+		pr_err("We do this! (Yes)\n");
 		u64 quantum = cl->rate.rate_bytes_ps;
 
 		do_div(quantum, q->rate2quantum);
