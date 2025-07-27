@@ -2013,25 +2013,6 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
 
 		q->active_queues = num_active_qs;
 
-
-		// if (q->dynamic_sync) {
-		// 	u64 r = div64_u64(q->bytes_diff*NSEC_PER_SEC, ktime_sub(now, q->last_checked_active));
-		// 	q->current_rate = cake_ewma(q->current_rate, r, 8);
-		// 	q->bytes_diff=0;
-		// 	// pr_err("Rate sum: %llu vs: target_rate %llu\n", rate_sum, q->rate_bps);
-		// 	// Are we using less bandwidth than we could?
-		// 	// Then lets reduce the synctime in hope we can use the additional cycles
-		// 	// for sending packets
-		// 	if (q->current_rate < (b->tin_rate_bps-(b->tin_rate_bps >> 6))) {
-		// 		q->sync_time = min(q->sync_time+10000, USEC_PER_SEC); // +10us, max 1ms
-		// 	}
-		// 	// We have enough "power" to fill the link, let's see if we can be
-		// 	// more accurate by lowering the synctime
-		// 	else if (q->current_rate >= (b->tin_rate_bps-(b->tin_rate_bps >> 6))) {
-		// 		q->sync_time = max(q->sync_time-10000, 10000); // -10us, 10us
-		// 	}
-		// }
-
 		// mtu = 0 is used to only update the rate and not mess with cobalt params
 		cake_set_rate(b, new_rate, 0, 0, 0);
 
@@ -2040,10 +2021,10 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
 		q->rate_shft=b->tin_rate_shft;
 
 		if (q->dynamic_sync) {
-			q->sync_time = (ktime_get() - now) << 4;
-			// sync for every 16*64 byte
-			// q->sync_time = ((64*q->rate_ns)>>q->rate_shft)<<4;
-			// q->dynamic_sync = true;
+			// q->sync_time = (ktime_get() - now) << 4;
+			// sync for every 8K byte (time to send 64 bytes * 128 (<<7))
+			q->sync_time = ((64*q->rate_ns)>>q->rate_shft)<<7;
+			q->dynamic_sync = true;
 		}
 	}
 
