@@ -65,6 +65,7 @@ MODULE_PARM_DESC(htb_hysteresis, "Hysteresis mode, less CPU load, less accurate"
 static int htb_rate_est = 0; /* htb classes have a default rate estimator */
 module_param(htb_rate_est, int, 0640);
 MODULE_PARM_DESC(htb_rate_est, "setup a default rate estimator (4sec 16sec) for htb classes");
+static struct Qdisc_ops htb_qdisc_ops; // Forward declaration
 
 /* used internaly to keep status of single class */
 enum htb_cmode {
@@ -180,6 +181,10 @@ struct htb_sched {
 	unsigned int            num_direct_qdiscs;
 
 	bool			offload;
+	struct list_head htb_qdisc_list;
+	u64 last_active;
+	u64 last_checked_active;
+	u64 active_queues;
 };
 
 /* find class in global hash table using given handle */
@@ -703,6 +708,25 @@ static void htb_charge_class(struct htb_sched *q, struct htb_class *cl,
 	s64 diff;
 
 	//TODO: Figure out the number of active queues.
+	// u64 other_last_active;
+	struct list_head *pos;
+	// u32 num_active_qs = 1;
+	int count = 0;
+
+	rcu_read_lock();
+	list_for_each_rcu(pos, &q->htb_qdisc_list) {
+		// struct htb_sched *other_priv = container_of(pos, struct htb_sched, htb_qdisc_list);
+		count++;
+		// u64 other_qlen = READ_ONCE(qdisc_from_priv(other_priv)->q.qlen);
+		//
+		// other_last_active = READ_ONCE(other_priv->last_active);
+		//
+		// if (other_qlen || other_last_active > q->last_checked_active) {
+		// 	num_active_qs++;
+		// }
+	}
+	rcu_read_unlock();
+	pr_err("Other qdiscs: %d\n", count);
 	while (cl) {
 		// TODO:  update tokens, buffer rate here
 		diff = min_t(s64, q->now - cl->t_c, cl->mbuffer);
@@ -954,8 +978,9 @@ ok:
 		return skb;
 	}
 
-	if (!sch->q.qlen)
+	if (!sch->q.qlen) {
 		goto fin;
+	}
 	q->now = ktime_get_ns();
 	start_at = jiffies;
 
@@ -1061,11 +1086,13 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt,
 	struct htb_sched *q = qdisc_priv(sch);
 	struct nlattr *tb[TCA_HTB_MAX + 1];
 	struct tc_htb_glob *gopt;
+	struct net_device *net;
+	spinlock_t *root_lock;
 	unsigned int ntx;
 	bool offload;
 	int err;
 
-	pr_err("Init htb: %s\n", __func__);
+	pr_err("Init htb (v2): %s\n", __func__);
 
 	qdisc_watchdog_init(&q->watchdog, sch);
 	INIT_WORK(&q->work, htb_work_func);
@@ -1092,6 +1119,7 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt,
 	offload = nla_get_flag(tb[TCA_HTB_OFFLOAD]);
 
 	if (offload) {
+		pr_err("We do not off load do we?\n");
 		if (sch->parent != TC_H_ROOT) {
 			NL_SET_ERR_MSG(extack, "HTB must be the root qdisc to use offload");
 			return -EOPNOTSUPP;
@@ -1122,6 +1150,24 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt,
 	if ((q->rate2quantum = gopt->rate2quantum) < 1)
 		q->rate2quantum = 1;
 	q->defcls = gopt->defcls;
+
+	INIT_LIST_HEAD_RCU(&q->htb_qdisc_list);
+	root_lock = qdisc_lock(qdisc_root(sch));
+	spin_lock(root_lock);
+	net = qdisc_dev(sch);
+	for (int i = 0; i < net->num_tx_queues; ++i){
+		if (net->_tx[i].qdisc->ops == &htb_qdisc_ops && net->_tx[i].qdisc->handle != sch->handle) {
+			struct htb_sched *other_priv = qdisc_priv(net->_tx[i].qdisc);
+			list_add_rcu(&q->htb_qdisc_list, &other_priv->htb_qdisc_list);
+			pr_err("found at %d\n", i);
+			break;
+		}
+	}
+
+	spin_unlock(root_lock);
+
+	q->active_queues=0;
+	q->last_checked_active = 0;
 
 	if (!offload)
 		return 0;
