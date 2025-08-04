@@ -708,25 +708,25 @@ static void htb_charge_class(struct htb_sched *q, struct htb_class *cl,
 	s64 diff;
 
 	//TODO: Figure out the number of active queues.
-	// u64 other_last_active;
+	u64 other_last_active;
 	struct list_head *pos;
-	// u32 num_active_qs = 1;
+	u32 num_active_qs = 1;
 	int count = 0;
 
 	rcu_read_lock();
 	list_for_each_rcu(pos, &q->htb_qdisc_list) {
-		// struct htb_sched *other_priv = container_of(pos, struct htb_sched, htb_qdisc_list);
+		struct htb_sched *other_priv = container_of(pos, struct htb_sched, htb_qdisc_list);
 		count++;
-		// u64 other_qlen = READ_ONCE(qdisc_from_priv(other_priv)->q.qlen);
-		//
-		// other_last_active = READ_ONCE(other_priv->last_active);
-		//
-		// if (other_qlen || other_last_active > q->last_checked_active) {
-		// 	num_active_qs++;
-		// }
+		u64 other_qlen = READ_ONCE(qdisc_from_priv(other_priv)->q.qlen);
+
+		other_last_active = READ_ONCE(other_priv->last_active);
+
+		if (other_qlen || other_last_active > q->last_checked_active) {
+			num_active_qs++;
+		}
 	}
 	rcu_read_unlock();
-	pr_err("Other qdiscs: %d\n", count);
+	pr_err("Other qdiscs: %d active_queues: %u\n", count, num_active_qs);
 	while (cl) {
 		// TODO:  update tokens, buffer rate here
 		diff = min_t(s64, q->now - cl->t_c, cl->mbuffer);
@@ -1879,7 +1879,7 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 	ceil64 = tb[TCA_HTB_CEIL64] ? nla_get_u64(tb[TCA_HTB_CEIL64]) : 0;
 
 	pr_err("rate64: %llu, ceil64: %llu\n", rate64, ceil64);
-	pr_err("hopt->rate: %u, hopt->ceil: %u\n", hopt->rate.rate, hopt->ceil.rate);
+	pr_err("hopt->rate: %u, hopt->ceil: %u bytes/sec\n", hopt->rate.rate, hopt->ceil.rate);
 
 	if (!cl) {		/* new class */
 		struct net_device *dev = qdisc_dev(sch);
@@ -2095,6 +2095,7 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 	/* it used to be a nasty bug here, we have to check that node
 	 * is really leaf before changing cl->leaf !
 	 */
+	pr_err("tokens %lld ctokens %lld\n", cl->tokens, cl->ctokens);
 	if (!cl->level) {
 		pr_err("We do this! (Yes)\n");
 		u64 quantum = cl->rate.rate_bytes_ps;
@@ -2114,10 +2115,12 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 			cl->quantum = hopt->quantum;
 		if ((cl->prio = hopt->prio) >= TC_HTB_NUMPRIO)
 			cl->prio = TC_HTB_NUMPRIO - 1;
+		pr_err("quantum: %i\n", cl->quantum);
 	}
 
 	cl->buffer = PSCHED_TICKS2NS(hopt->buffer);
 	cl->cbuffer = PSCHED_TICKS2NS(hopt->cbuffer);
+	pr_err("buffer %u ticks2ns %lli\n", hopt->buffer, cl->buffer);
 
 	sch_tree_unlock(sch);
 	qdisc_put(parent_qdisc);
