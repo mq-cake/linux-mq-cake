@@ -21,6 +21,7 @@
  *			fixed requeue routine
  *		and many others. thanks.
  */
+#include "linux/math64.h"
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/types.h>
@@ -67,6 +68,24 @@ module_param(htb_rate_est, int, 0640);
 MODULE_PARM_DESC(htb_rate_est, "setup a default rate estimator (4sec 16sec) for htb classes");
 static struct Qdisc_ops htb_qdisc_ops; // Forward declaration
 
+static void psched_ratecfg_precompute__(u64 rate, u32 *mult, u8 *shift)
+{
+	u64 factor = NSEC_PER_SEC;
+
+	*mult = 1;
+	*shift = 0;
+
+	if (rate <= 0)
+		return;
+
+	for (;;) {
+		*mult = div64_u64(factor, rate);
+		if (*mult & (1U << 31) || factor & (1ULL << 63))
+			break;
+		factor <<= 1;
+		(*shift)++;
+	}
+}
 /* used internaly to keep status of single class */
 enum htb_cmode {
 	HTB_CANT_SEND,		/* class can't send and can't borrow */
@@ -185,6 +204,10 @@ struct htb_sched {
 	u64 last_active;
 	u64 last_checked_active;
 	u64 active_queues;
+	u64 global_rate;
+	u64 global_ceil;
+	u64 global_buffer;
+	u64 global_cbuffer;
 };
 
 /* find class in global hash table using given handle */
@@ -711,22 +734,36 @@ static void htb_charge_class(struct htb_sched *q, struct htb_class *cl,
 	u64 other_last_active;
 	struct list_head *pos;
 	u32 num_active_qs = 1;
-	int count = 0;
 
-	rcu_read_lock();
-	list_for_each_rcu(pos, &q->htb_qdisc_list) {
-		struct htb_sched *other_priv = container_of(pos, struct htb_sched, htb_qdisc_list);
-		count++;
-		u64 other_qlen = READ_ONCE(qdisc_from_priv(other_priv)->q.qlen);
+	// For now there is only one class, this is just an initial start
+	if (q->now-q->last_checked_active >= 10000) {
+		rcu_read_lock();
+		list_for_each_rcu(pos, &q->htb_qdisc_list) {
+			struct htb_sched *other_priv = container_of(pos, struct htb_sched, htb_qdisc_list);
+			u64 other_qlen = READ_ONCE(qdisc_from_priv(other_priv)->q.qlen);
 
-		other_last_active = READ_ONCE(other_priv->last_active);
+			other_last_active = READ_ONCE(other_priv->last_active);
 
-		if (other_qlen || other_last_active > q->last_checked_active) {
-			num_active_qs++;
+			if (other_qlen || other_last_active > q->last_checked_active) {
+				num_active_qs++;
+			}
 		}
+		rcu_read_unlock();
+		// pr_err("Other qdiscs: %d active_queues: %u\n", count, num_active_qs);
+		// TODO: only update if num_active_queues is different from the last time?
+		if (num_active_qs >= 1) {
+			cl->rate.rate_bytes_ps = div64_u64(q->global_rate, num_active_qs);
+			psched_ratecfg_precompute__(cl->rate.rate_bytes_ps, &cl->rate.mult, &cl->rate.shift);
+			cl->ceil.rate_bytes_ps = div64_u64(q->global_ceil, num_active_qs);
+			psched_ratecfg_precompute__(cl->ceil.rate_bytes_ps, &cl->ceil.mult, &cl->ceil.shift);
+			cl->buffer = q->global_buffer * num_active_qs;
+			cl->cbuffer = q->global_cbuffer *num_active_qs;
+		}
+		q->active_queues = num_active_qs;
+		q->last_checked_active = q->now;
+		// pr_err("rate: %llu, ceil %llu buffer %llu cbuffer %llu\n", cl->rate.rate_bytes_ps, cl->ceil.rate_bytes_ps, cl->buffer, cl->cbuffer);
 	}
-	rcu_read_unlock();
-	pr_err("Other qdiscs: %d active_queues: %u\n", count, num_active_qs);
+	q->last_active = q->now;
 	while (cl) {
 		// TODO:  update tokens, buffer rate here
 		diff = min_t(s64, q->now - cl->t_c, cl->mbuffer);
@@ -1953,6 +1990,7 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 		if (!q->offload) {
 			dev_queue = sch->dev_queue;
 		} else if (!(parent && !parent->level)) {
+			pr_err("Do I need to worry about this?\n");
 			/* Assign a dev_queue to this classid. */
 			offload_opt = (struct tc_htb_qopt_offload) {
 				.command = TC_HTB_LEAF_ALLOC_QUEUE,
@@ -1974,6 +2012,7 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 			}
 			dev_queue = netdev_get_tx_queue(dev, offload_opt.qid);
 		} else { /* First child. */
+			pr_err("are we here?\n");
 			dev_queue = htb_offload_get_queue(parent);
 			old_q = htb_graft_helper(dev_queue, NULL);
 			WARN_ON(old_q != parent->leaf.q);
@@ -2046,6 +2085,7 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 		cl->t_c = ktime_get_ns();
 		cl->cmode = HTB_CAN_SEND;
 
+
 		/* attach to the hash list and parent's family */
 		qdisc_class_hash_insert(&q->clhash, &cl->common);
 		if (parent)
@@ -2064,6 +2104,7 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 		}
 
 		if (q->offload) {
+			pr_err("Probably not here\n");
 			struct net_device *dev = qdisc_dev(sch);
 
 			offload_opt = (struct tc_htb_qopt_offload) {
@@ -2121,6 +2162,11 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 	cl->buffer = PSCHED_TICKS2NS(hopt->buffer);
 	cl->cbuffer = PSCHED_TICKS2NS(hopt->cbuffer);
 	pr_err("buffer %u ticks2ns %lli\n", hopt->buffer, cl->buffer);
+	q->global_rate = cl->rate.rate_bytes_ps;
+	q->global_ceil = cl->ceil.rate_bytes_ps;
+	q->global_buffer = cl->buffer;
+	q->global_cbuffer = cl->cbuffer;
+
 
 	sch_tree_unlock(sch);
 	qdisc_put(parent_qdisc);
