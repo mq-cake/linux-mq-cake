@@ -310,7 +310,7 @@ static struct sk_buff *tbf_dequeue(struct Qdisc *sch)
 		unsigned int len = qdisc_pkt_len(skb);
 		now = ktime_get_ns();
 
-		if (now-q->last_checked_active >= 10000) {
+		if (now-q->last_checked_active >= 100000) {
 			u64 other_last_active;
 			struct list_head *pos;
 			u32 num_active_qs = 1;
@@ -356,7 +356,6 @@ static struct sk_buff *tbf_dequeue(struct Qdisc *sch)
 		if ((toks|ptoks) >= 0) {
 			skb = qdisc_dequeue_peeked(q->qdisc);
 			if (unlikely(!skb)) {
-				pr_err("empty\n");
 				return NULL;
 			}
 
