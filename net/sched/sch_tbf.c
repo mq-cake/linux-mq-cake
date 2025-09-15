@@ -112,6 +112,10 @@ struct tbf_sched_data {
 	struct qdisc_watchdog watchdog;	/* Watchdog timer */
 };
 
+struct tbf_shared_data {
+	struct list_head tbf_qdisc_list;
+};
+
 
 /* Time to Length, convert time in ns to length in bytes
  * to determinate how many bytes can be sent in given time.
@@ -591,6 +595,18 @@ static void tbf_walk(struct Qdisc *sch, struct qdisc_walker *walker)
 	}
 }
 
+static void tbf_shared_init(void *shared_data)
+{
+	struct tbf_shared_data *shared = shared_data;
+
+	INIT_LIST_HEAD(&shared->tbf_qdisc_list);
+}
+
+static void tbf_shared_assign(struct Qdisc *sch, void *shared_data)
+{
+	pr_err("%d\n", sch->handle);
+}
+
 static const struct Qdisc_class_ops tbf_class_ops = {
 	.graft		=	tbf_graft,
 	.leaf		=	tbf_leaf,
@@ -604,6 +620,7 @@ static struct Qdisc_ops tbf_qdisc_ops __read_mostly = {
 	.cl_ops		=	&tbf_class_ops,
 	.id		=	"tbf",
 	.priv_size	=	sizeof(struct tbf_sched_data),
+	.shared_size    =	sizeof(struct tbf_shared_data),
 	.enqueue	=	tbf_enqueue,
 	.dequeue	=	tbf_dequeue,
 	.peek		=	qdisc_peek_dequeued,
@@ -612,6 +629,8 @@ static struct Qdisc_ops tbf_qdisc_ops __read_mostly = {
 	.destroy	=	tbf_destroy,
 	.change		=	tbf_change,
 	.dump		=	tbf_dump,
+	.shared_init	=	tbf_shared_init,
+	.shared_assign	=	tbf_shared_assign,
 	.owner		=	THIS_MODULE,
 };
 MODULE_ALIAS_NET_SCH("tbf");
