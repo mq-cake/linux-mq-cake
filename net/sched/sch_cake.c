@@ -3249,97 +3249,43 @@ static struct Qdisc_ops cake_qdisc_ops __read_mostly = {
 MODULE_ALIAS_NET_SCH("cake");
 
 struct cake_mq_sched {
-	struct Qdisc **qdiscs;
+	struct mq_sched mq_priv; /* must be first */
 	struct cake_sched_config cake_config;
 };
 
 static void cake_mq_destroy(struct Qdisc *sch)
 {
-	struct net_device *dev = qdisc_dev(sch);
-	struct cake_mq_sched *priv = qdisc_priv(sch);
-	unsigned int ntx;
-
-	if (!priv->qdiscs)
-		return;
-	for (ntx = 0; ntx < dev->num_tx_queues && priv->qdiscs[ntx]; ntx++)
-		qdisc_put(priv->qdiscs[ntx]);
-	kfree(priv->qdiscs);
+	mq_destroy_common(sch);
 }
 
 static int cake_mq_init(struct Qdisc *sch, struct nlattr *opt,
 			struct netlink_ext_ack *extack)
 {
-	struct net_device *dev = qdisc_dev(sch);
 	struct cake_mq_sched *priv = qdisc_priv(sch);
-	struct netdev_queue *dev_queue;
-	struct Qdisc *qdisc;
-	unsigned int ntx;
+	struct net_device *dev = qdisc_dev(sch);
+	int ret, ntx;
 	bool _unused;
-	int ret;
-
-	if (sch->parent != TC_H_ROOT)
-		return -EOPNOTSUPP;
-
-	if (!netif_is_multiqueue(dev))
-		return -EOPNOTSUPP;
 
 	cake_config_init(&priv->cake_config, true);
 	ret = cake_config_change(&priv->cake_config, opt, extack, &_unused);
 	if (ret)
 		return ret;
 
-	/* pre-allocate qdiscs, attachment can't fail */
-	priv->qdiscs = kcalloc(dev->num_tx_queues, sizeof(priv->qdiscs[0]),
-			       GFP_KERNEL);
-	if (!priv->qdiscs)
-		return -ENOMEM;
+	ret = mq_init_common(sch, opt, extack, &cake_qdisc_ops);
+	if (ret)
+		return ret;
 
-	for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
-		dev_queue = netdev_get_tx_queue(dev, ntx);
-		qdisc = qdisc_create_dflt(dev_queue, &cake_qdisc_ops,
-					  TC_H_MAKE(TC_H_MAJ(sch->handle),
-						    TC_H_MIN(ntx + 1)),
-					  extack);
-		if (!qdisc) {
-			kfree(priv->qdiscs);
-			return -ENOMEM;
-		}
-		priv->qdiscs[ntx] = qdisc;
-		qdisc->flags |= TCQ_F_ONETXQUEUE | TCQ_F_NOPARENT;
-		cake_config_replace(qdisc, &priv->cake_config);
-	}
-
-	sch->flags |= TCQ_F_MQROOT;
+	for (ntx = 0; ntx < dev->num_tx_queues; ntx++)
+		cake_config_replace(priv->mq_priv.qdiscs[ntx], &priv->cake_config);
 
 	return 0;
-}
-
-static void cake_mq_attach(struct Qdisc *sch)
-{
-	struct net_device *dev = qdisc_dev(sch);
-	struct cake_mq_sched *priv = qdisc_priv(sch);
-	struct Qdisc *qdisc, *old;
-	unsigned int ntx;
-
-	for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
-		qdisc = priv->qdiscs[ntx];
-		old = dev_graft_qdisc(qdisc->dev_queue, qdisc);
-		if (old)
-			qdisc_put(old);
-#ifdef CONFIG_NET_SCHED
-		if (ntx < dev->real_num_tx_queues)
-			qdisc_hash_add(qdisc, false);
-#endif
-	}
-	kfree(priv->qdiscs);
-	priv->qdiscs = NULL;
 }
 
 static int cake_mq_change(struct Qdisc *sch, struct nlattr *opt,
 			  struct netlink_ext_ack *extack)
 {
-	struct net_device *dev = qdisc_dev(sch);
 	struct cake_mq_sched *priv = qdisc_priv(sch);
+	struct net_device *dev = qdisc_dev(sch);
 	bool overhead_changed = false;
 	unsigned int ntx;
 	int ret;
@@ -3371,49 +3317,9 @@ static int cake_mq_change(struct Qdisc *sch, struct nlattr *opt,
 static int cake_mq_dump(struct Qdisc *sch, struct sk_buff *skb)
 {
 	struct cake_mq_sched *qd = qdisc_priv(sch);
-	struct net_device *dev = qdisc_dev(sch);
-	struct Qdisc *qdisc;
-	unsigned int ntx;
 
-	sch->q.qlen = 0;
-	gnet_stats_basic_sync_init(&sch->bstats);
-	memset(&sch->qstats, 0, sizeof(sch->qstats));
-
-	/* MQ supports lockless qdiscs. However, statistics accounting needs
-	 * to account for all, none, or a mix of locked and unlocked child
-	 * qdiscs. Percpu stats are added to counters in-band and locking
-	 * qdisc totals are added at end.
-	 */
-	for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
-		qdisc = rtnl_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
-		spin_lock_bh(qdisc_lock(qdisc));
-
-		gnet_stats_add_basic(&sch->bstats, qdisc->cpu_bstats,
-				     &qdisc->bstats, false);
-		gnet_stats_add_queue(&sch->qstats, qdisc->cpu_qstats,
-				     &qdisc->qstats);
-		sch->q.qlen += qdisc_qlen(qdisc);
-
-		spin_unlock_bh(qdisc_lock(qdisc));
-	}
-
+	mq_dump_common(sch, skb);
 	return cake_config_dump(&qd->cake_config, skb);
-}
-
-static struct netdev_queue *cake_mq_queue_get(struct Qdisc *sch, unsigned long cl)
-{
-	struct net_device *dev = qdisc_dev(sch);
-	unsigned long ntx = cl - 1;
-
-	if (ntx >= dev->num_tx_queues)
-		return NULL;
-	return netdev_get_tx_queue(dev, ntx);
-}
-
-static struct netdev_queue *cake_mq_select_queue(struct Qdisc *sch,
-						 struct tcmsg *tcm)
-{
-	return cake_mq_queue_get(sch, TC_H_MIN(tcm->tcm_parent));
 }
 
 static int cake_mq_graft(struct Qdisc *sch, unsigned long cl, struct Qdisc *new,
@@ -3423,68 +3329,14 @@ static int cake_mq_graft(struct Qdisc *sch, unsigned long cl, struct Qdisc *new,
 	return -EOPNOTSUPP;
 }
 
-static struct Qdisc *cake_mq_leaf(struct Qdisc *sch, unsigned long cl)
-{
-	struct netdev_queue *dev_queue = cake_mq_queue_get(sch, cl);
-
-	return rtnl_dereference(dev_queue->qdisc_sleeping);
-}
-
-static unsigned long cake_mq_find(struct Qdisc *sch, u32 classid)
-{
-	unsigned int ntx = TC_H_MIN(classid);
-
-	if (!cake_mq_queue_get(sch, ntx))
-		return 0;
-	return ntx;
-}
-
-static int cake_mq_dump_class(struct Qdisc *sch, unsigned long cl,
-			      struct sk_buff *skb, struct tcmsg *tcm)
-{
-	struct netdev_queue *dev_queue = cake_mq_queue_get(sch, cl);
-
-	tcm->tcm_parent = TC_H_ROOT;
-	tcm->tcm_handle |= TC_H_MIN(cl);
-	tcm->tcm_info = rtnl_dereference(dev_queue->qdisc_sleeping)->handle;
-	return 0;
-}
-
-static int cake_mq_dump_class_stats(struct Qdisc *sch, unsigned long cl,
-				    struct gnet_dump *d)
-{
-	struct netdev_queue *dev_queue = cake_mq_queue_get(sch, cl);
-
-	sch = rtnl_dereference(dev_queue->qdisc_sleeping);
-	if (gnet_stats_copy_basic(d, sch->cpu_bstats, &sch->bstats, true) < 0 ||
-	    qdisc_qstats_copy(d, sch) < 0)
-		return -1;
-	return 0;
-}
-
-static void cake_mq_walk(struct Qdisc *sch, struct qdisc_walker *arg)
-{
-	struct net_device *dev = qdisc_dev(sch);
-	unsigned int ntx;
-
-	if (arg->stop)
-		return;
-
-	arg->count = arg->skip;
-	for (ntx = arg->skip; ntx < dev->num_tx_queues; ntx++) {
-		if (!tc_qdisc_stats_dump(sch, ntx + 1, arg))
-			break;
-	}
-}
-
 static const struct Qdisc_class_ops cake_mq_class_ops = {
-	.select_queue	= cake_mq_select_queue,
+	.select_queue	= mq_select_queue,
 	.graft		= cake_mq_graft,
-	.leaf		= cake_mq_leaf,
-	.find		= cake_mq_find,
-	.walk		= cake_mq_walk,
-	.dump		= cake_mq_dump_class,
-	.dump_stats	= cake_mq_dump_class_stats,
+	.leaf		= mq_leaf,
+	.find		= mq_find,
+	.walk		= mq_walk,
+	.dump		= mq_dump_class,
+	.dump_stats	= mq_dump_class_stats,
 };
 
 static struct Qdisc_ops cake_mq_qdisc_ops __read_mostly = {
@@ -3493,7 +3345,7 @@ static struct Qdisc_ops cake_mq_qdisc_ops __read_mostly = {
 	.priv_size	=	sizeof(struct cake_mq_sched),
 	.init		=	cake_mq_init,
 	.destroy	=	cake_mq_destroy,
-	.attach		= cake_mq_attach,
+	.attach		= mq_attach,
 	.change		=	cake_mq_change,
 	.change_real_num_tx = mq_change_real_num_tx,
 	.dump		=	cake_mq_dump,
