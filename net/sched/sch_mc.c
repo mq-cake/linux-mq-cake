@@ -16,9 +16,8 @@
 #define WD_SLACK 0
 #define RETRIES_MAX 80
 
-static atomic64_t time_next_packet_global;
-static u64 stale_slack;
-// static atomic64_t packet_count_global;
+static atomic64_t time_next_packet_global ____cacheline_aligned;
+static atomic64_t packet_count_global ____cacheline_aligned;
 // static u64 time_next_packet_global;
  
 struct mc_sched_data {
@@ -59,11 +58,10 @@ static int mc_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 		return NET_XMIT_DROP;
 	}
 
-    // uint64_t pkt_count = atomic64_fetch_add(1, &packet_count_global);
+    uint64_t pkt_count = atomic64_fetch_add(1, &packet_count_global);
     // prevent stale shaper state
-    u64 now = ktime_get_ns();
-    if (READ_ONCE(time_next_packet_global.counter) < (now-stale_slack)) {
-        WRITE_ONCE(time_next_packet_global.counter, now);
+    if (pkt_count == 0) {
+        WRITE_ONCE(time_next_packet_global.counter, ktime_get_ns());
     }
 
 	list_add_tail(&skb->list, &priv->q);
@@ -110,7 +108,7 @@ static struct sk_buff *mc_qdisc_dequeue(struct Qdisc *sch)
 	// we could send a packet
 	if ( time_next_packet_local <= now ) {
 	    atomic64_fetch_add(len,&time_next_packet_global);
-        // atomic64_fetch_add(-1, &packet_count_global);
+        atomic64_fetch_add(-1, &packet_count_global);
     } else { // the next time to send a packet is in the future
         sch->qstats.overlimits++;
         qdisc_watchdog_schedule_range_ns(&priv->watchdog, time_next_packet_local, 0);
@@ -268,10 +266,6 @@ static int mc_init(struct Qdisc *sch, struct nlattr *opt,
 
 	if (opt)
 		err = mc_change(sch, opt, extack);
-
-    if (priv->max_rate) {
-        stale_slack = div_u64((2*1500*NSEC_PER_SEC), priv->max_rate);
-    }
 
 	pr_err("rate: %u\n", priv->max_rate);
 	pr_err("sync_time: %llu\n", priv->sync_time);
