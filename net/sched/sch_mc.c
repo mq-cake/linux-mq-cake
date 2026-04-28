@@ -17,6 +17,7 @@
 #define RETRIES_MAX 80
 
 static atomic64_t time_next_packet_global;
+static atomic64_t packet_count_global;
 // static u64 time_next_packet_global;
  
 struct mc_sched_data {
@@ -57,6 +58,11 @@ static int mc_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 		return NET_XMIT_DROP;
 	}
 
+    uint64_t pkt_count = atomic64_fetch_add(1, &packet_count_global);
+    // prevent stale shaper state
+    if (pkt_count == 0) {
+        WRITE_ONCE(time_next_packet_global.counter, ktime_get_ns());
+    }
 
 	list_add_tail(&skb->list, &priv->q);
 	priv->qlen++;
@@ -97,17 +103,12 @@ static struct sk_buff *mc_qdisc_dequeue(struct Qdisc *sch)
 	len = div64_ul(len, priv->max_rate);
 
 	now = ktime_get_ns();
-	u64 time_next_packet_local = atomic64_read(&time_next_packet_global);
+	u64 time_next_packet_local = READ_ONCE(time_next_packet_global.counter);
     
-    if (unlikely(time_next_packet_local == 0)) {
-        atomic64_set(&time_next_packet_global, now);
-        pr_err("now: %llu\n", now);
-    }
-
 	// we could send a packet
 	if ( time_next_packet_local <= now ) {
-		// compensate for watchdog overhead and/or inaccuracies
 	    atomic64_fetch_add(len,&time_next_packet_global);
+        atomic64_fetch_add(-1, &packet_count_global);
     } else { // the next time to send a packet is in the future
         sch->qstats.overlimits++;
         qdisc_watchdog_schedule_range_ns(&priv->watchdog, time_next_packet_local, 0);
